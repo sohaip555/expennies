@@ -1,91 +1,92 @@
 <?php
 
-declare(strict_types = 1);
-
 namespace App\Controllers;
 
-use App\Contracts\AuthInterface;
-use App\Contracts\RequestValidatorFactoryInterface;
-use App\DataObjects\RegisterUserData;
-use App\Enum\AuthAttemptStatus;
+use App\Entity\User;
 use App\Exception\ValidationException;
-use App\RequestValidators\RegisterUserRequestValidator;
-use App\RequestValidators\TwoFactorLoginRequestValidator;
-use App\RequestValidators\UserLoginRequestValidator;
-use App\ResponseFormatter;
+use Doctrine\ORM\EntityManager;
+use Doctrine\ORM\Exception\ORMException;
+use Doctrine\ORM\OptimisticLockException;
+use JetBrains\PhpStorm\NoReturn;
 use Psr\Http\Message\ServerRequestInterface as Request;
 use Psr\Http\Message\ResponseInterface as Response;
 use Slim\Views\Twig;
+use Twig\Error\LoaderError;
+use Twig\Error\RuntimeError;
+use Twig\Error\SyntaxError;
+use Valitron\Validator;
 
 class AuthController
 {
-    public function __construct(
-        private readonly Twig $twig,
-        private readonly RequestValidatorFactoryInterface $requestValidatorFactory,
-        private readonly AuthInterface $auth,
-        private readonly ResponseFormatter $responseFormatter
-    ) {
+    public function __construct(private readonly Twig $twig, private readonly EntityManager  $entityManager)
+    {
     }
 
-    public function loginView(Response $response): Response
+    public function loginView(Request $request, Response $response): Response
     {
         return $this->twig->render($response, 'auth/login.twig');
     }
 
-    public function registerView(Response $response): Response
+    public function registerView(Request $request, Response $response): Response
     {
         return $this->twig->render($response, 'auth/register.twig');
     }
 
     public function register(Request $request, Response $response): Response
     {
-        $data = $this->requestValidatorFactory->make(RegisterUserRequestValidator::class)->validate(
-            $request->getParsedBody()
-        );
+        $data = $request->getParsedBody();
 
-        $this->auth->register(
-            new RegisterUserData($data['name'], $data['email'], $data['password'])
-        );
+        $v = new Validator($_POST);
+        $v->rule('required', ['name', 'email', 'password']);
+        $v->rule('email', 'email');
+        $v->rule('equals', 'password', 'confirmPassword')->label('Confirm Password');
+        $v->rule(fn ($field, $value, $params, $fields) =>  $this->entityManager->getRepository(User::class)->count(['email' => $value]) === 0, 'email')
+            ->message('User with the given email address already exists');
 
-        return $response->withHeader('Location', '/')->withStatus(302);
+        if ((!$v->validate())) {
+            throw new ValidationException($v->errors());
+        }
+
+        $user = new User();
+        $user->setName($data['name']);
+        $user->setEmail($data['email']);
+        $user->setPassword(password_hash($data['password'], PASSWORD_BCRYPT, ['cost' => 12]));
+
+        $this->entityManager->persist($user);
+        $this->entityManager->flush();
+
+        $_SESSION['user'] = $user->getId();
+        return $response;
     }
 
     public function logIn(Request $request, Response $response): Response
     {
-        $data = $this->requestValidatorFactory->make(UserLoginRequestValidator::class)->validate(
-            $request->getParsedBody()
-        );
+        $data = $request->getParsedBody();
 
-        $status = $this->auth->attemptLogin($data);
+        $v = new Validator($data);
 
-        if ($status === AuthAttemptStatus::FAILED) {
+        $v->rule('required', ['email', 'password']);
+        $v->rule('email', 'email');
+
+        $user = $this->entityManager->getRepository(User::class)->findOneBy(['email' => $data['email']]);
+
+        if (! $user || ! password_verify($data['password'], $user->getPassword())) {
             throw new ValidationException(['password' => ['You have entered an invalid username or password']]);
         }
 
-        if ($status === AuthAttemptStatus::TWO_FACTOR_AUTH) {
-            return $this->responseFormatter->asJson($response, ['two_factor' => true]);
-        }
+        session_regenerate_id();
 
-        return $this->responseFormatter->asJson($response, []);
-    }
-
-    public function logOut(Response $response): Response
-    {
-        $this->auth->logOut();
+        $_SESSION['user'] = $user->getId();
 
         return $response->withHeader('Location', '/')->withStatus(302);
     }
 
-    public function twoFactorLogin(Request $request, Response $response): Response
+
+    public function logOut(Request $request, Response $response)
     {
-        $data = $this->requestValidatorFactory->make(TwoFactorLoginRequestValidator::class)->validate(
-            $request->getParsedBody()
-        );
+        unset($_SESSION['user']);
 
-        if (! $this->auth->attemptTwoFactorLogin($data)) {
-            throw new ValidationException(['code' => ['Invalid Code']]);
-        }
-
-        return $response;
+        return $response->withHeader('Location', '/')->withStatus(302);
     }
+
 }
